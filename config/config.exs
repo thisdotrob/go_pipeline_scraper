@@ -5,6 +5,7 @@ config :scraper, go_username: System.get_env("GO_USERNAME")
 config :scraper, go_password: System.get_env("GO_PASSWORD")
 config :scraper, go_base_url: System.get_env("GO_BASE_URL")
 
-config :hound, driver: "selenium"
-config :hound, browser: "chrome"
+config :hound, driver: "phantomjs"
+# config :hound, driver: "selenium"
+# config :hound, browser: "chrome"
 config :hound, http: [timeout: :infinity]
