@@ -1,63 +1,90 @@
 defmodule Scraper do
+  import Application, only: [fetch_env!: 2]
+  import Enum, only: [each: 2, map: 2, join: 2, into: 2]
 
   use Hound.Helpers
 
+  @cmd_fields [ "Command",               "Arguments",
+                  "Working Directory",     "Pipeline Name",
+                  "Stage Name",            "Job Name",
+                  "Source Directory",      "Destination",
+                  "Build File",            "Target" ]
+
+  @env_fields [ "Type", "Name", "Value" ]
+
+  @env_filename "env_variables.csv"
+  @cmd_filename "commands.csv"
+
   def start do
     Hound.start_session
-    {:ok, pipeline_name} = Application.fetch_env(:scraper, :go_pipeline_name)
-    {:ok, username} = Application.fetch_env(:scraper, :go_username)
-    {:ok, password} = Application.fetch_env(:scraper, :go_password)
-    {:ok, base_url} = Application.fetch_env(:scraper, :go_base_url)
-    login(username, password, base_url)
-    reset_files
-    links = get_stages_links(pipeline_name)
-    {:ok, env_file} = File.open "env_variables.csv", [:append]
-    {:ok, commands_file} = File.open "commands.csv", [:append]
-    patterns = ["Command: ", "Arguments: ", "Working Directory: ", "Pipeline Name: ", "Stage Name: ", "Job Name: ", "Source Directory: ", "Destination: ", "Build File: ", "Target: "]
-    titles = Enum.join(["", "Run if" | patterns], ",")
-    write_row([titles], commands_file)
-    scrape(links, patterns, env_file, commands_file)
+    files = [@env_filename, @cmd_filename] |> reset_files
+    files |> write_headers
+    get_vars |> get_stages_links |> each(&scrape(&1, files))
+    files |> each(&(File.close(&1)))
     Hound.end_session
-    File.close env_file
-    File.close commands_file
   end
 
-  def get_stages_links(pipeline_name) do
-    pipeline = find_element(:id, "pipeline_group_#{pipeline_name}_panel", 0)
-    settings_buttons = find_all_within_element(pipeline, :class, "setting", 0)
-    get_attributes(settings_buttons, "href")
+  defp reset_files(filenames) do
+    filenames |> each(&(File.rm(&1)))
+    filenames |> map(&({&1, File.open!(&1, [:append])})) |> into(%{})
   end
 
-  def scrape(urls, patterns, env_file, commands_file) do
-    scrape_super_stage(hd(urls), patterns, env_file, commands_file)
+  defp write_headers(files) do
+    [""|@env_fields] |> join(",") |> write_row(files[@env_filename])
+    [",Run if"|@cmd_fields] |> join(",") |> write_row(files[@cmd_filename])
+  end
+
+  defp get_vars do
+    [user, pwd, url, pipeline] =
+      [:go_username, :go_password, :go_base_url, :go_pipeline_name]
+      |> map(&(fetch_env!(:scraper, &1)))
+    %{ username: user, password: pwd, url: url, pipeline_name: pipeline }
+  end
+
+  defp login(%{url: url, username: username, password: password}) do
+    navigate_to(url)
+    find_element(:id, "user_login") |> fill_field(username)
+    elem = find_element(:id, "user_password")
+    fill_field(elem, password)
+    submit_element(elem)
+  end
+
+  defp get_stages_links(vars) do
+    Map.drop(vars, [:pipeline_name]) |> login
+    find_element(:id, "pipeline_group_#{vars[:pipeline_name]}_panel")
+      |> find_all_within_element(:class, "setting")
+      |> map(&(attribute_value(&1, "href")))
+  end
+
+  defp map_attributes(list, attribute_name) do
+    Enum.map(list, fn(x) -> attribute_value(x, attribute_name) end)
+  end
+
+  defp scrape(url, files) do
+    env_file = files[@env_filename]
+    cmd_file = files[@cmd_filename]
+    navigate_to(url)
+    scrape_vars(env_file)
+    find_element(:class, "stages")
+      |> find_all_within_element(:tag, "a")
+      |> map(&(attribute_value(&1, "href")))
+      |> each(&(scrape_sub_stage(&1, env_file, cmd_file)))
+  end
+
+  defp scrape_sub_stages(urls, env_file, commands_file) do
+    scrape_sub_stage(hd(urls), env_file, commands_file)
     if length(urls) > 1 do
-      scrape(tl(urls), patterns, env_file, commands_file)
+      scrape_sub_stages(tl(urls), env_file, commands_file)
     end
   end
 
-  def scrape_super_stage(url, patterns, env_file, commands_file) do
+  defp scrape_sub_stage(url, env_file, commands_file) do
     navigate_to(url)
-    scrape_vars(env_file)
-    container = find_element(:class, "stages", 0)
-    sub_stage_links = find_all_within_element(container, :tag, "a", 0)
-    sub_stage_urls = get_attributes(sub_stage_links, "href")
-    scrape_sub_stages(sub_stage_urls, env_file, commands_file, patterns)
-  end
-
-  def scrape_sub_stages(urls, env_file, commands_file, patterns) do
-    scrape_sub_stage(hd(urls), env_file, commands_file, patterns)
-    if length(urls) > 1 do
-      scrape_sub_stages(tl(urls), env_file, commands_file, patterns)
-    end
-  end
-
-  def scrape_sub_stage(url, env_file, commands_file, patterns) do
-    navigate_to(url)
-    scrape_tasks(commands_file, patterns)
+    scrape_tasks(commands_file)
     scrape_vars(env_file)
   end
 
-  def scrape_vars(file) do
+  defp scrape_vars(file) do
     environment_vars_link = find_element(:id, "environment_variables", 0)
     environment_vars_a = find_within_element(environment_vars_link, :tag, "a")
     env_vars_href = attribute_value(environment_vars_a, "href")
@@ -78,15 +105,15 @@ defmodule Scraper do
     end
   end
 
-  def get_vars(elem) do
+  defp get_vars(elem) do
     name_elems = find_all_within_element(elem, :class, "environment_variable_name", 0)
     val_elems = find_all_within_element(elem, :class, "environment_variable_value", 0)
-    names = List.delete(get_attributes(name_elems, "value"), "")
-    vals = List.delete(get_attributes(val_elems, "value"), "")
+    names = List.delete(map_attributes(name_elems, "value"), "")
+    vals = List.delete(map_attributes(val_elems, "value"), "")
     merge(names, vals)
   end
 
-  def get_secure_vars do
+  defp get_secure_vars do
     try do
       get_vars(find_element(:id, "variables_secure", 0))
     rescue
@@ -95,17 +122,17 @@ defmodule Scraper do
     end
   end
 
-  def scrape_tasks(file, patterns) do
+  defp scrape_tasks(file) do
     rows = get_task_rows
     if (length(rows) > 0) do
       write_row([get_stage_name], file)
       tasks = get_tasks(rows)
-      csvified_tasks = get_csvified_tasks(tasks, patterns)
+      csvified_tasks = get_csvified_tasks(tasks)
       write_row(csvified_tasks, file)
     end
   end
 
-  def get_task_rows do
+  defp get_task_rows do
     try do
       container = find_element(:class, "tasks_list_table", 0)
       tbody = find_within_element(container, :tag, "tbody", 0)
@@ -116,11 +143,11 @@ defmodule Scraper do
     end
   end
 
-  def get_tasks([]) do
+  defp get_tasks([]) do
     []
   end
 
-  def get_tasks([head|tail]) do
+  defp get_tasks([head|tail]) do
     try do
       runif = visible_text(find_within_element(head, :class, "run_ifs", 0))
       properties = visible_text(find_within_element(head, :class, "properties", 0))
@@ -133,63 +160,41 @@ defmodule Scraper do
     end
   end
 
-  def get_csvified_tasks([], patterns) do
-    []
+  defp get_csvified_tasks([]), do: []
+  defp get_csvified_tasks([hd|tl]) do
+    csvified_task = @cmd_fields |> map(&("#{&1}: ")) |> csvify(hd, ",")
+    [csvified_task|get_csvified_tasks(tl)]
   end
 
-  def get_csvified_tasks([head|tail], patterns) do
-    csvified_task = csvify(head, patterns, ",")
-    [csvified_task|get_csvified_tasks(tail, patterns)]
-  end
-
-  def csvify(task, [], to_insert) do
-    task
-  end
-
-  def csvify(task, [pattern|tail], to_insert) do
+  defp csvify([], string, seperators), do: string
+  defp csvify([pattern|patterns_tl], string, seperators) do
     cond do
-      String.contains?(task, pattern) ->
-        csvify(String.replace(task, pattern, to_insert), tail, ",")
-      true ->
-        csvify(task, tail, to_insert <> ",")
+      String.contains?(string, pattern) ->
+        csvify(patterns_tl, String.replace(string, pattern, seperators), ",")
+      :else ->
+        csvify(patterns_tl, string, seperators <> ",")
     end
   end
 
-  def write_row(tasks, file) when length(tasks) <= 1 do
-    IO.binwrite(file, hd(tasks) <> "\n")
+  defp write_row(task, file) when is_binary(task) do
+    IO.binwrite(file, task <> "\n")
   end
 
-  def write_row(tasks, file) do
+  defp write_row([], file), do: :ok
+  defp write_row(tasks, file) do
     IO.binwrite(file, hd(tasks) <> "\n")
     write_row(tl(tasks), file)
   end
 
-  def get_attributes(list, attribute_name) do
-    Enum.map(list, fn(x) -> attribute_value(x, attribute_name) end)
-  end
-
-  def merge([names_hd|names_tl], [vals_hd|vals_tl]) do
+  defp merge([names_hd|names_tl], [vals_hd|vals_tl]) do
     ["#{names_hd},#{vals_hd}"|merge(names_tl, vals_tl)]
   end
 
-  def merge([], []) do
+  defp merge([], []) do
     []
   end
 
-  def login(username, password, base_url) do
-    string = navigate_to(base_url)
-    find_element(:id, "user_login", 0) |> fill_field(username)
-    element = find_element(:id, "user_password", 0)
-    fill_field(element, password)
-    submit_element(element)
-  end
-
-  def reset_files do
-    File.rm "env_variables.csv"
-    File.rm "commands.csv"
-  end
-
-  def get_stage_name do
+  defp get_stage_name do
     visible_text(find_element(:class, "pipeline_header", 0))
   end
 end
