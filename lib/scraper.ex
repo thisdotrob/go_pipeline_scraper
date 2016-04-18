@@ -1,14 +1,16 @@
 defmodule Scraper do
   import Application, only: [fetch_env!: 2]
   import Enum, only: [each: 2, map: 2, join: 2, into: 2]
+  import Map, only: [drop: 2]
+  import List, only: [delete: 2]
 
   use Hound.Helpers
 
   @cmd_fields [ "Command",               "Arguments",
-                  "Working Directory",     "Pipeline Name",
-                  "Stage Name",            "Job Name",
-                  "Source Directory",      "Destination",
-                  "Build File",            "Target" ]
+                "Working Directory",     "Pipeline Name",
+                "Stage Name",            "Job Name",
+                "Source Directory",      "Destination",
+                "Build File",            "Target" ]
 
   @env_fields [ "Type", "Name", "Value" ]
 
@@ -17,16 +19,21 @@ defmodule Scraper do
 
   def start do
     Hound.start_session
-    files = [@env_filename, @cmd_filename] |> reset_files
+    files = [@env_filename, @cmd_filename] |> get_reset_files
     files |> write_headers
-    get_vars |> get_stages_links |> each(&scrape(&1, files))
+    get_running_system_vars |> get_stages_links |> each(&scrape(&1, files))
     files |> each(&(File.close(&1)))
     Hound.end_session
   end
 
-  defp reset_files(filenames) do
+  defp get_reset_files(filenames) do
     filenames |> each(&(File.rm(&1)))
-    filenames |> map(&({&1, File.open!(&1, [:append])})) |> into(%{})
+
+    create_opened_file_tuple = fn(filename) ->
+      {filename, File.open!(filename, [:append])}
+    end
+
+    filenames |> map(&(create_opened_file_tuple.(&1))) |> into(%{})
   end
 
   defp write_headers(files) do
@@ -34,7 +41,7 @@ defmodule Scraper do
     [",Run if"|@cmd_fields] |> join(",") |> write_row(files[@cmd_filename])
   end
 
-  defp get_vars do
+  defp get_running_system_vars do
     [user, pwd, url, pipeline] =
       [:go_username, :go_password, :go_base_url, :go_pipeline_name]
       |> map(&(fetch_env!(:scraper, &1)))
@@ -50,112 +57,82 @@ defmodule Scraper do
   end
 
   defp get_stages_links(vars) do
-    Map.drop(vars, [:pipeline_name]) |> login
+    drop(vars, [:pipeline_name]) |> login
     find_element(:id, "pipeline_group_#{vars[:pipeline_name]}_panel")
       |> find_all_within_element(:class, "setting")
       |> map(&(attribute_value(&1, "href")))
-  end
-
-  defp map_attributes(list, attribute_name) do
-    Enum.map(list, fn(x) -> attribute_value(x, attribute_name) end)
   end
 
   defp scrape(url, files) do
     env_file = files[@env_filename]
     cmd_file = files[@cmd_filename]
     navigate_to(url)
-    scrape_vars(env_file)
+    scrape_and_write_vars(env_file)
     find_element(:class, "stages")
       |> find_all_within_element(:tag, "a")
       |> map(&(attribute_value(&1, "href")))
       |> each(&(scrape_sub_stage(&1, env_file, cmd_file)))
   end
 
-  defp scrape_sub_stages(urls, env_file, commands_file) do
-    scrape_sub_stage(hd(urls), env_file, commands_file)
-    if length(urls) > 1 do
-      scrape_sub_stages(tl(urls), env_file, commands_file)
-    end
-  end
-
-  defp scrape_sub_stage(url, env_file, commands_file) do
+  defp scrape_sub_stage(url, env_file, cmd_file) do
     navigate_to(url)
-    scrape_tasks(commands_file)
-    scrape_vars(env_file)
+    scrape_tasks(cmd_file)
+    scrape_and_write_vars(env_file)
   end
 
-  defp scrape_vars(file) do
-    environment_vars_link = find_element(:id, "environment_variables", 0)
-    environment_vars_a = find_within_element(environment_vars_link, :tag, "a")
-    env_vars_href = attribute_value(environment_vars_a, "href")
-    navigate_to(env_vars_href)
-    stage_name = get_stage_name
-    env_vars = get_vars(find_element(:id, "variables", 0))
-    secure_vars = get_secure_vars
-    env_vars = Enum.map(env_vars, fn(x) -> ",env," <> x end)
-    secure_vars = Enum.map(secure_vars, fn(x) -> ",secure," <> x end)
-    if length(env_vars) + length(secure_vars) > 0 do
-      write_row([stage_name], file)
-    end
-    if length(env_vars) > 0 do
-      write_row(env_vars, file)
-    end
-    if length(secure_vars) > 0 do
-      write_row(secure_vars, file)
-    end
-  end
-
-  defp get_vars(elem) do
-    name_elems = find_all_within_element(elem, :class, "environment_variable_name", 0)
-    val_elems = find_all_within_element(elem, :class, "environment_variable_value", 0)
-    names = List.delete(map_attributes(name_elems, "value"), "")
-    vals = List.delete(map_attributes(val_elems, "value"), "")
-    merge(names, vals)
-  end
-
-  defp get_secure_vars do
+  defp scrape_tasks(cmd_file) do
     try do
-      get_vars(find_element(:id, "variables_secure", 0))
+      find_element(:class, "tasks_list_table")
+        |> find_within_element(:tag, "tbody")
+        |> find_all_within_element(:tag, "tr")
+        |> get_tasks
+        |> get_csvified_tasks
+        |> write_row(cmd_file)
     rescue
-      RuntimeError -> "No secure variables found."
+      e in RuntimeError -> IO.puts(e.message)
+    end
+  end
+
+  defp scrape_and_write_vars(file) do
+    find_element(:id, "environment_variables")
+      |> find_within_element(:tag, "a")
+      |> attribute_value("href")
+      |> navigate_to
+    env_vars = extract_vars("variables") |> map(&(",env," <> &1))
+    secure_vars = extract_vars("variables_secure") |> map(&(",secure," <> &1))
+    var_count = length(env_vars) + length(secure_vars)
+    if var_count > 0, do: write_row([get_stage_name], file)
+    if length(env_vars) > 0, do: write_row(env_vars, file)
+    if length(secure_vars) > 0, do: write_row(secure_vars, file)
+  end
+
+  defp extract_vars(elem_name) do
+    extract = fn(class_name) ->
+      find_element(:id, elem_name)
+      |> find_all_within_element(:class, class_name)
+      |> map(&(attribute_value(&1, "value")))
+      |> delete("")
+    end
+    try do
+      names = "environment_variable_name" |> extract.()
+      vals = "environment_variable_value" |> extract.()
+      merge(names, vals)
+    rescue
+      e in RuntimeError -> IO.puts(e.message)
       []
     end
   end
 
-  defp scrape_tasks(file) do
-    rows = get_task_rows
-    if (length(rows) > 0) do
-      write_row([get_stage_name], file)
-      tasks = get_tasks(rows)
-      csvified_tasks = get_csvified_tasks(tasks)
-      write_row(csvified_tasks, file)
-    end
-  end
-
-  defp get_task_rows do
-    try do
-      container = find_element(:class, "tasks_list_table", 0)
-      tbody = find_within_element(container, :tag, "tbody", 0)
-      find_all_within_element(tbody, :tag, "tr", 0)
-    rescue
-      RuntimeError -> "No tasks found."
-      []
-    end
-  end
-
-  defp get_tasks([]) do
-    []
-  end
-
+  defp get_tasks([]), do: []
   defp get_tasks([head|tail]) do
     try do
-      runif = visible_text(find_within_element(head, :class, "run_ifs", 0))
-      properties = visible_text(find_within_element(head, :class, "properties", 0))
-      task = "," <> runif <> properties
+      runif = find_within_element(head, :class, "run_ifs") |> visible_text
+      props = head |> find_within_element(:class, "properties") |> visible_text
+      task = "," <> runif <> props
       formatted_task = String.replace(task, "\n", " ")
       [formatted_task|get_tasks(tail)]
     rescue
-      RuntimeError -> "No task in this row."
+      e in RuntimeError -> IO.puts(e.message)
       [""|get_tasks(tail)]
     end
   end
@@ -166,7 +143,7 @@ defmodule Scraper do
     [csvified_task|get_csvified_tasks(tl)]
   end
 
-  defp csvify([], string, seperators), do: string
+  defp csvify([], string, _), do: string
   defp csvify([pattern|patterns_tl], string, seperators) do
     cond do
       String.contains?(string, pattern) ->
@@ -180,18 +157,15 @@ defmodule Scraper do
     IO.binwrite(file, task <> "\n")
   end
 
-  defp write_row([], file), do: :ok
+  defp write_row([], _), do: :ok
   defp write_row(tasks, file) do
     IO.binwrite(file, hd(tasks) <> "\n")
     write_row(tl(tasks), file)
   end
 
+  defp merge([], []), do: []
   defp merge([names_hd|names_tl], [vals_hd|vals_tl]) do
-    ["#{names_hd},#{vals_hd}"|merge(names_tl, vals_tl)]
-  end
-
-  defp merge([], []) do
-    []
+    ["#{names_hd},#{vals_hd}" | merge(names_tl, vals_tl)]
   end
 
   defp get_stage_name do
